@@ -33,3 +33,9 @@ page yourself rather than asking the person you are working for. See
 ### Issue tracker
 
 Issues and PRDs live as GitHub issues on your own copy of this repo (the `origin` remote), never on `ai-hero-dev/cohort-005-project`, managed with the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+## Sandbox
+
+If `$SANDBOX` == `1` then you are running in a docker based [Sandbox](https://github.com/MaibornWolff/sandbox).
+
+You can run [allowed](.sandbox/config.toml) commands on the host like `sandbox escape -- gh auth status`.

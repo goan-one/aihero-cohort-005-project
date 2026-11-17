@@ -1,0 +1,91 @@
+# Project-specific sandbox config (merged with global)
+
+# Session environment: applies to each shell or command, not startup services.
+# Changes to these values do not prevent container reuse.
+# "VAR" passes through from host, "VAR=value" sets explicitly. Last assignment wins.
+# Reserved: SANDBOX, SANDBOX_*, CLAUDE_CODE_SSE_PORT, DISPLAY, X11_AVAILABLE.
+# `sandbox container start` does not apply env.
+# env = ["DATABASE_URL=postgres://localhost:5432/dev"]
+
+# Persistence - project-relative paths useful for build artifacts
+# persist_paths = [
+#   { path = "~/.gradle" },
+#   { path = "./node_modules", only_if_exists = true  },
+#   { path = "./**/node_modules" },
+#   { path = "./.venv", only_if_exists = true },
+#   { path = "./**/.venv" },
+# ]
+
+# Settings
+# settings = ["~/.project-tool/*.json"]
+
+# Host commands
+# SECURITY: Each matching command runs on the host with your user permissions.
+# Only allow commands and arguments that you trust.
+#
+# [[allow_host_commands]]
+# pattern = ["bun", "run", "test:e2e"]
+#
+# [[allow_host_commands]]
+# pattern = ["git", ["status", "diff", "log"]]
+# test_match = [["git", "status"]]
+# test_no_match = [["git", "push"]]
+
+# Network
+# allow_network = ["api.internal.example.com"]
+
+# Ports
+# ports = ["3000", "5432:5432"]
+
+# Mounts
+# mounts = ["../shared-lib", "../data:rw"]
+
+# Options
+# readonly = true
+
+
+# ---------------------------------------------------------------------------
+# GitHub CLI (`gh`) on the host, for the workflows in docs/agents/issue-tracker.md
+#
+# How to read a pattern: every argument of the command must match, in order.
+#   "issue"            exact argument
+#   ["view", "list"]   one argument, any of these
+#   "*"                any number of further arguments (anything goes)
+#   { regex = '...' }  one argument matching the regex (whole argument)
+# test_match / test_no_match are example commands Sandbox checks on load;
+# they don't grant anything, they only catch mistakes in the pattern.
+# ---------------------------------------------------------------------------
+
+# 1. Issues and PRs: create, view, list, comment, label, assign, close, ...
+#    Broad on purpose (simple). Note it also allows things like `gh pr merge`.
+[[allow_host_commands]]
+pattern = ["gh", ["issue", "pr"], "*"]
+test_match = [["gh", "issue", "list", "--state", "open"], ["gh", "pr", "diff", "7"]]
+
+# 2. Check login, and view/set which repo `gh` targets (must be origin).
+#    Narrow on purpose: `gh repo delete` etc. stay blocked.
+[[allow_host_commands]]
+pattern = ["gh", "auth", "status"]
+
+[[allow_host_commands]]
+pattern = ["gh", "repo", "set-default", ["--view", "goan-one/aihero-cohort-005-project"]]
+test_no_match = [["gh", "repo", "set-default", "ai-hero-dev/cohort-005-project"]]
+
+# 3. Wayfinder, read side: fetch an issue (e.g. its database id or blocker
+#    summary) or list its sub-issues / blockers. Only this repo's issues.
+#    Extra args may only be --jq/--paginate and their values (no "-X DELETE").
+[[allow_host_commands]]
+pattern = ["gh", "api", { regex = 'repos/goan-one/aihero-cohort-005-project/issues/[0-9]+(/sub_issues|/dependencies/blocked_by)?' }, { repeat = ["--jq", "--paginate", { regex = '[^-].*' }], min = 0, max = 3 }]
+test_match = [["gh", "api", "repos/goan-one/aihero-cohort-005-project/issues/123", "--jq", ".id"]]
+test_no_match = [["gh", "api", "repos/goan-one/aihero-cohort-005-project/issues/123", "-X", "DELETE"], ["gh", "api", "user"]]
+
+# 4. Wayfinder, write side: link a child as sub-issue of the map, or add a
+#    "blocked by" edge. The id must be a plain number, so `-F x=@file`
+#    (which would upload a host file) is refused.
+[[allow_host_commands]]
+pattern = ["gh", "api", ["--method", "-X"], "POST", { regex = 'repos/goan-one/aihero-cohort-005-project/issues/[0-9]+/(sub_issues|dependencies/blocked_by)' }, "-F", { regex = '(sub_issue_id|issue_id)=[0-9]+' }]
+test_match = [
+  ["gh", "api", "--method", "POST", "repos/goan-one/aihero-cohort-005-project/issues/123/dependencies/blocked_by", "-F", "issue_id=987654"],
+  ["gh", "api", "--method", "POST", "repos/goan-one/aihero-cohort-005-project/issues/123/sub_issues", "-F", "sub_issue_id=987654"],
+]
+test_no_match = [["gh", "api", "--method", "POST", "repos/goan-one/aihero-cohort-005-project/issues/123/sub_issues", "-F", "sub_issue_id=@/etc/passwd"]]
