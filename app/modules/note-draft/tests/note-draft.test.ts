@@ -25,8 +25,8 @@ describe("noteDraftStatus", () => {
     expect(status.canSave).toBe(false);
   });
 
-  it("does not allow saving a blank draft", () => {
-    const status = noteDraftStatus("   ", "");
+  it("does not allow saving a draft cleared to whitespace", () => {
+    const status = noteDraftStatus("   ", "hello");
     expect(status.unsaved).toBe(true);
     expect(status.canSave).toBe(false);
   });
@@ -41,5 +41,18 @@ describe("noteDraftStatus", () => {
     const status = noteDraftStatus("abcd", "", 3);
     expect(status.tooLong).toBe(true);
     expect(status.canSave).toBe(false);
+  });
+
+  it("has nothing to save once the server has stored the trimmed draft", () => {
+    const status = noteDraftStatus("hello \n", "hello");
+    expect(status.unsaved).toBe(false);
+    expect(status.canSave).toBe(false);
+  });
+
+  it("does not count surrounding whitespace against the limit", () => {
+    const status = noteDraftStatus("  abc  ", "", 3);
+    expect(status.length).toBe(3);
+    expect(status.tooLong).toBe(false);
+    expect(status.canSave).toBe(true);
   });
 });

@@ -14,10 +14,13 @@ export function describeDraft(
   savedBody: string,
   max: number = MAX_NOTE_LENGTH
 ): NoteDraftStatus {
-  const length = draft.length;
+  // The server trims before it checks the length and stores the body, so the
+  // draft is judged by what Save would actually store.
+  const stored = draft.trim();
+  const length = stored.length;
   const tooLong = length > max;
-  const empty = draft.trim().length === 0;
-  const unsaved = draft !== savedBody;
+  const empty = length === 0;
+  const unsaved = stored !== savedBody;
   return {
     length,
     max,

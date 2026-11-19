@@ -3,7 +3,7 @@ import { describeDraft, type NoteDraftStatus } from "./lib/note-draft";
 export type { NoteDraftStatus };
 
 /**
- * What the Lesson Note editor shows for a draft: its length against the
+ * What the Note editor on the Lesson page shows for a draft: its length against the
  * limit, whether it has unsaved changes, and whether Save is allowed.
  */
 export function noteDraftStatus(
