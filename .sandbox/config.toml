@@ -38,14 +38,36 @@
 # ports = ["3000", "5432:5432"]
 
 # Mounts
-# mounts = ["../shared-lib", "../data:rw"]
+# There are none, and none are needed. The container reads the remote's
+# branches as a single file, `.git-mirror.bundle`, which
+# .sandbox/host-commands/sandbox-git-fetch.sh renames into the project; the
+# bare mirror it is made from lives outside the project, in
+# ${XDG_CACHE_HOME:-$HOME/.cache}/sandbox-git-mirrors, where the container
+# cannot write at all. So nothing host git reads is container-writable, and
+# nothing container-writable needs protecting.
+#
+# This replaced an in-project bare mirror at `./.git-mirror`, which host git
+# fetched into on every run — a repository the container could tamper with.
+# A read-only mount would have been the obvious fix and cannot be had here:
+#   - a project configuration may only mount paths inside the project
+#     (mount-path-resolution.ts rejects the rest), and the mirror was already
+#     inside the project, mounted read-write with everything else. Only a mount
+#     at the same absolute container path would shadow that, and the project's
+#     absolute path is per-machine, which a committed configuration cannot know
+#     (requirement R3);
+#   - `"./.git-mirror:ro"` does not even express it: Sandbox expands a
+#     one-sided entry to `<source>:<source>:ro` and resolves only the source,
+#     so the container target stays the relative string `./.git-mirror`, which
+#     the container runtime rejects as a mount path.
+# That dead end is why the mirror moved out of the project instead.
 
 # Options
 # readonly = true
 
 
 # ---------------------------------------------------------------------------
-# GitHub CLI (`gh`) on the host, for the workflows in docs/agents/issue-tracker.md
+# Host commands: one rule, a hash-checked loader, through which push, fetch and
+# `gh` all run. Nothing else is allowed on the host.
 #
 # How to read a pattern: every argument of the command must match, in order.
 #   "issue"            exact argument
@@ -56,36 +78,197 @@
 # they don't grant anything, they only catch mistakes in the pattern.
 # ---------------------------------------------------------------------------
 
-# 1. Issues and PRs: create, view, list, comment, label, assign, close, ...
-#    Broad on purpose (simple). Note it also allows things like `gh pr merge`.
+# 1. The hash-checked loader: push, fetch, and a narrow `gh` for issues and PRs.
+#
+#    It replaces the old rule `pattern = ["gh", ["issue", "pr"], "*"]`, which
+#    allowed `gh pr merge`, and `--body-file <any host file>`, and resolved the
+#    bare name `gh` through the host's PATH from a working directory the
+#    container chooses.
+#
+#    The rule names /bin/sh (absolute, present on every macOS and Linux host)
+#    and passes the loader program below as the -c text. The loader runs one of
+#    this project's host-command scripts, and only after checking the script's
+#    sha256 against the pinned list in this rule. The hash is the control, not
+#    the path, because
+#      - the path is an argument the container chooses, and the working
+#        directory a host command runs in is chosen by the container too, so a
+#        look-alike can sit anywhere under the project, and
+#      - rules are compiled once, at session start, so a script edited during
+#        a session stops matching the hash that was trusted when it began.
+#    The loader additionally works out the project root from its working
+#    directory, which the broker guarantees is a real directory inside the host
+#    project, and insists that the script be the root's own — read step 1 and 2
+#    of the program below.
+#
+#    Agents do not type this rule; they use .sandbox/host-commands/run, which
+#    builds the invocation and reads the loader text back out of this file.
+#    See .sandbox/host-commands/README.md and
+#    docs/sandbox-host-access/design-decisions.md.
+#
+#    After editing a script: `npm run sandbox:hash`, restart the sandbox, and
+#    review `git diff .sandbox/` at the trust prompt. That prompt is the
+#    security boundary for this file. Read the loader below like a program,
+#    because that is what it is.
+#
+#    There is deliberately no test_match: a positive example would have to
+#    embed one of the hashes below, and the whole configuration would then fail
+#    to load the first time a script changes. The positive side is checked by
+#    scripts/sandbox-host-command-hashes.test.ts instead.
 [[allow_host_commands]]
-pattern = ["gh", ["issue", "pr"], "*"]
-test_match = [["gh", "issue", "list", "--state", "open"], ["gh", "pr", "diff", "7"]]
+pattern = [
+  "/bin/sh",
+  "-c",
+  # A TOML multi-line literal string: every character between the triple-quote
+  # delimiters below reaches /bin/sh verbatim, as a single argument. Keep it
+  # that way — the broker compares this text byte for byte with what the
+  # container sends, and .sandbox/host-commands/run reads it back out of this
+  # file. Keep the delimiters on lines of their own, and out of the comments.
+  '''
+set -euf
+# $1 is the script to run and $2 its expected sha256; the rest are its own
+# arguments. Both come from the container, so neither is trusted.
+script=$1
+want=$2
+shift 2
 
-# 2. Check login, and view/set which repo `gh` targets (must be origin).
-#    Narrow on purpose: `gh repo delete` etc. stay blocked.
-[[allow_host_commands]]
-pattern = ["gh", "auth", "status"]
+# Find the project root. The broker maps the container's working directory to
+# a real directory inside the host project and refuses anything else, so the
+# working directory is a trustworthy foothold, while the script path is only a
+# request. Climb to the topmost ancestor that holds a sandbox configuration —
+# the file this loader itself was read from.
+here=$(pwd -P) || {
+  echo "sandbox-host-command: cannot read the working directory" >&2
+  exit 1
+}
+root=
+dir=$here
+while [ -n "$dir" ]; do
+  if [ -f "$dir/.sandbox/config.toml" ]; then root=$dir; fi
+  dir=${dir%/*}
+done
 
-[[allow_host_commands]]
-pattern = ["gh", "repo", "set-default", ["--view", "goan-one/aihero-cohort-005-project"]]
-test_no_match = [["gh", "repo", "set-default", "ai-hero-dev/cohort-005-project"]]
+# Resolve the script path before using it, so that ".." cannot make a path
+# that lands inside the project look like a path somewhere else.
+case $script in
+/*/.sandbox/host-commands/*) ;;
+*)
+  echo "sandbox-host-command: $script is not a path under .sandbox/host-commands." >&2
+  exit 126
+  ;;
+esac
+dir=$(cd -- "${script%/*}" 2>/dev/null && pwd -P) || {
+  echo "sandbox-host-command: no such directory: ${script%/*}" >&2
+  exit 126
+}
+script=$dir/${script##*/}
+case $dir in
+*/.sandbox/host-commands) ;;
+*)
+  echo "sandbox-host-command: $script resolves outside .sandbox/host-commands." >&2
+  exit 126
+  ;;
+esac
+: "${root:=${dir%/.sandbox/host-commands}}"
+case $script in
+"$root"/.sandbox/host-commands/*) ;;
+*)
+  echo "sandbox-host-command: refusing $script: the sandbox project root here is $root, so the only scripts that can run are the ones in $root/.sandbox/host-commands." >&2
+  exit 126
+  ;;
+esac
+[ -f "$script" ] || {
+  echo "sandbox-host-command: not a regular file: $script" >&2
+  exit 126
+}
 
-# 3. Wayfinder, read side: fetch an issue (e.g. its database id or blocker
-#    summary) or list its sub-issues / blockers. Only this repo's issues.
-#    Extra args may only be --jq/--paginate and their values (no "-X DELETE").
-[[allow_host_commands]]
-pattern = ["gh", "api", { regex = 'repos/goan-one/aihero-cohort-005-project/issues/[0-9]+(/sub_issues|/dependencies/blocked_by)?' }, { repeat = ["--jq", "--paginate", { regex = '[^-].*' }], min = 0, max = 3 }]
-test_match = [["gh", "api", "repos/goan-one/aihero-cohort-005-project/issues/123", "--jq", ".id"]]
-test_no_match = [["gh", "api", "repos/goan-one/aihero-cohort-005-project/issues/123", "-X", "DELETE"], ["gh", "api", "user"]]
+# Leave the working directory the container chose, and keep the project out of
+# PATH: the host's system directories go in front of every PATH entry that is
+# absolute and outside the project, and nothing else survives. Helpers below
+# (mktemp, cp, sha256sum) and the git and gh the scripts use therefore never
+# come out of the project.
+cd /
+keep=
+IFS=:
+for entry in ${PATH:-}; do
+  case $entry in
+  "" | [!/]*) continue ;;
+  "$root" | "$root"/*) continue ;;
+  esac
+  keep=$keep:$entry
+done
+unset IFS
+PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin$keep
+export PATH
 
-# 4. Wayfinder, write side: link a child as sub-issue of the map, or add a
-#    "blocked by" edge. The id must be a plain number, so `-F x=@file`
-#    (which would upload a host file) is refused.
-[[allow_host_commands]]
-pattern = ["gh", "api", ["--method", "-X"], "POST", { regex = 'repos/goan-one/aihero-cohort-005-project/issues/[0-9]+/(sub_issues|dependencies/blocked_by)' }, "-F", { regex = '(sub_issue_id|issue_id)=[0-9]+' }]
-test_match = [
-  ["gh", "api", "--method", "POST", "repos/goan-one/aihero-cohort-005-project/issues/123/dependencies/blocked_by", "-F", "issue_id=987654"],
-  ["gh", "api", "--method", "POST", "repos/goan-one/aihero-cohort-005-project/issues/123/sub_issues", "-F", "sub_issue_id=987654"],
+# Hash the copy and run the copy. A script rewritten between the check and the
+# run is then a script that was never checked.
+copy=$(mktemp "${TMPDIR:-/tmp}/sandbox-host-command.XXXXXX") || {
+  echo "sandbox-host-command: could not create a temporary file in ${TMPDIR:-/tmp}" >&2
+  exit 1
+}
+trap 'rm -f "$copy"' EXIT HUP INT TERM
+case $copy in
+"$root"/*)
+  echo "sandbox-host-command: TMPDIR is inside the project, which the container can write. Unset TMPDIR, or point it outside $root." >&2
+  exit 1
+  ;;
+esac
+cp -- "$script" "$copy" || {
+  echo "sandbox-host-command: could not copy $script" >&2
+  exit 1
+}
+sum=$(sha256sum "$copy" 2>/dev/null || shasum -a 256 "$copy") || {
+  echo "sandbox-host-command: the host has neither sha256sum nor shasum" >&2
+  exit 1
+}
+[ "${sum%% *}" = "$want" ] || {
+  echo "sandbox-host-command: refusing $script: its sha256 is not pinned in .sandbox/config.toml. If you edited the script, run npm run sandbox:hash, restart the sandbox, and review git diff .sandbox/ at the trust prompt." >&2
+  exit 126
+}
+SANDBOX_PROJECT_DIR=$root /bin/sh "$copy" "$@"
+''',
+  "sandbox-host-command",
+  { regex = '/([^/]+/)*\.sandbox/host-commands/sandbox-(gh|git-fetch|git-push)\.sh' },
+  # BEGIN sandbox:hash — written by `npm run sandbox:hash`, do not edit by hand
+  [
+    "d894ea712c71a5b8d353eb6705dbebf2a8aa887e892c2350d4ea2a483716601e", # sandbox-gh.sh
+    "dd682048d7eea5114778451c8c2ed5764664ebfe6bb7f689c59b470510241bdb", # sandbox-git-fetch.sh
+    "a34de436701e62c1bca498ef304eebecef80e17e175180de65e3922e23e62e71", # sandbox-git-push.sh
+  ],
+  # END sandbox:hash
+  "*",
 ]
-test_no_match = [["gh", "api", "--method", "POST", "repos/goan-one/aihero-cohort-005-project/issues/123/sub_issues", "-F", "sub_issue_id=@/etc/passwd"]]
+test_no_match = [["/bin/sh", "-c", "echo anything else"]]
+
+# That is the only rule, and `gh` is deliberately not a second one.
+#
+# There used to be three more: `["gh", "auth", "status"]`, and two
+# `["gh", "api", ...]` rules for the Wayfinder sub-issue and "blocked by"
+# endpoints, each with its argv pinned down to the shape of the URL. They were
+# removed because an argv pattern cannot make them safe:
+#
+#   - THE ENVIRONMENT. A host command is given the environment of the `sandbox`
+#     process (broker.ts hands its own process.env to the child), `--jq` takes
+#     a jq program, and `env` is a jq builtin. So
+#     `gh api repos/.../issues/1 --jq env` printed the host's whole environment
+#     — including a GH_TOKEN or an AWS key in the shell `sandbox` was started
+#     from — into the container. No regex on that argument can prevent it: the
+#     argument is a program, and `.|env` starts like any legitimate expression.
+#     Only something that *replaces* the environment fixes it, and a rule
+#     cannot; sandbox-gh.sh runs gh through `env -i` with a short fixed list
+#     that holds no token.
+#   - THE EXECUTABLE. `gh` in a rule is a bare name, resolved through the
+#     host's PATH from a working directory the container chooses. Only the
+#     loader guarantees a sanitised PATH and an absolute executable.
+#   - `gh repo set-default`, which an older rule allowed, was also the one
+#     remaining way to make host `gh` run git *inside the project*, whose
+#     config and hooks the container writes.
+#
+# Everything those rules did is now `run gh ...`: `auth status`, and an `api`
+# topic that allows exactly the same endpoints, with the repository built into
+# the path by the script and every id checked digit by digit. See the WHY NO
+# RULE MAY NAME `gh` ANY MORE header in .sandbox/host-commands/sandbox-gh.sh.
+#
+# The same reasoning applies to any new rule: if the command takes an argument
+# that is a program or a path, or if its name is not absolute, it belongs
+# behind the loader and not here.

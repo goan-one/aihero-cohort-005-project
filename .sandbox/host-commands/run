@@ -1,0 +1,151 @@
+#!/bin/sh
+# run — the command an agent inside the sandbox actually types.
+#
+# WHAT
+#   .sandbox/host-commands/run push <branch>...
+#   .sandbox/host-commands/run fetch
+#   .sandbox/host-commands/run gh <pr|issue|api|auth> ...
+#   .sandbox/host-commands/run loader
+#
+#   Runs INSIDE the container. It builds the `sandbox escape` invocation that
+#   the loader rule in .sandbox/config.toml expects: /bin/sh -c <loader> with
+#   the script's path and the script's sha256 as the first two arguments.
+#
+# WHY IT IS SHAPED THIS WAY
+#   The loader text and the pinned hashes live in .sandbox/config.toml, so this
+#   file reads the loader out of the configuration and computes the hash from
+#   the script, instead of keeping a second copy of either. Nothing here is
+#   trusted and nothing here needs to be:
+#     - the rule set in force is the one compiled when the session started, so
+#       an edited config.toml makes the command stop matching and be refused;
+#     - an edited script hashes to something that is not in the pinned list, so
+#       the command is refused — by the broker, before the host runs anything.
+#   Fail-closed in both directions. This file is therefore a convenience, not a
+#   control, and it is not itself hash-pinned.
+#
+# NOTES
+#   POSIX sh. Container side only — it never runs on the host.
+#
+# EXIT CODES
+#   the host command's exit code   1 could not build the invocation
+#   2 wrong usage
+# shellcheck disable=SC3043 # `local` is not in POSIX, but dash, ash and bash
+# all support it, and the container's /bin/sh is one of those.
+set -eu
+
+# Set by main, read by the functions below.
+PROJECT_DIR=
+CONFIG=
+
+usage() {
+  cat <<'EOF'
+Usage: .sandbox/host-commands/run <command> [argument]...
+
+Every operation that needs the host runs through here. The commands are:
+
+  push <branch>...     publish work branches to the remote
+  fetch                update the host's mirror of the remote and write
+                       .git-mirror.bundle, to fetch from in the container
+  gh <pr|issue|api|auth> ...
+                       issues, pull requests, the Wayfinder api endpoints
+                       and `auth status` — narrowly allow-listed
+  loader               print the loader program that .sandbox/config.toml
+                       runs on the host (for debugging this helper)
+
+For example:
+
+  .sandbox/host-commands/run push fix/devui-switcher-close
+  .sandbox/host-commands/run fetch
+  .sandbox/host-commands/run gh pr view 7 --comments
+
+Each command runs a script on the host. `--help` in place of its arguments
+prints that script's own usage, including what it refuses and why:
+
+  .sandbox/host-commands/run push --help
+
+See .sandbox/host-commands/README.md.
+EOF
+}
+
+die() {
+  echo "run: $*" >&2
+  exit 1
+}
+
+die_usage() {
+  echo "run: $*" >&2
+  usage >&2
+  exit 2
+}
+
+script_for() {
+  case $1 in
+  push) printf '%s\n' "sandbox-git-push.sh" ;;
+  fetch) printf '%s\n' "sandbox-git-fetch.sh" ;;
+  gh) printf '%s\n' "sandbox-gh.sh" ;;
+  *) printf '%s\n' "" ;;
+  esac
+}
+
+sha256_of() {
+  local sum
+  sum=$(sha256sum "$1" 2>/dev/null || shasum -a 256 "$1") ||
+    die "could not hash $1"
+  printf '%s\n' "${sum%% *}"
+}
+
+# The loader is the one TOML multi-line literal string in the configuration:
+# the lines between a line that is only ''' and the line that closes it. A
+# wrong guess here cannot grant anything — the broker compares the text with
+# the rule it compiled at session start and refuses anything else.
+loader_from_config() {
+  local text
+  [ "$(grep -c "^ *'''\$" "$CONFIG")" = "1" ] ||
+    die "$CONFIG does not hold exactly one ''' string — which one is the loader?"
+  text=$(sed -n "/^ *'''\$/,/^''',\$/p" "$CONFIG" | sed '1d;$d')
+  [ -n "$text" ] ||
+    die "no loader found in $CONFIG — has the host-command rule been removed?"
+  printf '%s\n' "$text"
+}
+
+main() {
+  local subcommand script hash loader
+  PROJECT_DIR=$(cd -- "$(dirname -- "$0")/../.." && pwd) ||
+    die "could not find the project directory from $0"
+  CONFIG=$PROJECT_DIR/.sandbox/config.toml
+  [ -f "$CONFIG" ] || die "not found: $CONFIG"
+
+  subcommand=${1:-}
+  case $subcommand in
+  "") die_usage "say which command to run" ;;
+  -h | --help | help)
+    usage
+    exit 0
+    ;;
+  loader)
+    loader_from_config
+    exit 0
+    ;;
+  esac
+  shift
+
+  script=$(script_for "$subcommand")
+  [ -n "$script" ] || die_usage "unknown command: $subcommand"
+  script=$PROJECT_DIR/.sandbox/host-commands/$script
+  [ -f "$script" ] || die "not found: $script"
+
+  command -v sandbox >/dev/null ||
+    die "sandbox is not on PATH — this helper only works inside the sandbox"
+
+  hash=$(sha256_of "$script")
+  # The string in the configuration ends with a newline, because its closing
+  # ''' is on a line of its own, and command substitution drops it. Put it
+  # back: the broker compares the -c text byte for byte.
+  loader="$(loader_from_config)
+"
+
+  exec sandbox escape -- /bin/sh -c "$loader" sandbox-host-command \
+    "$script" "$hash" "$@"
+}
+
+main "$@"

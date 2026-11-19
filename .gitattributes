@@ -1,2 +1,11 @@
 *.sh text eol=lf
 .husky/* text eol=lf
+
+# Host-command scripts are pinned by sha256 in .sandbox/config.toml. A CRLF
+# checkout would change every hash, so the line endings are forced here.
+.sandbox/host-commands/* text eol=lf
+
+# The same for the configuration itself: it carries the loader as a shell
+# program inside a TOML string, and a CR at the end of each of its lines would
+# be a syntax error on the host.
+.sandbox/config.toml text eol=lf

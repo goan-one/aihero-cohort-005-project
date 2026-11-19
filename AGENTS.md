@@ -38,4 +38,12 @@ Issues and PRDs live as GitHub issues on your own copy of this repo (the `origin
 
 If `$SANDBOX` == `1` then you are running in a docker based [Sandbox](https://github.com/MaibornWolff/sandbox).
 
-You can run [allowed](.sandbox/config.toml) commands on the host like `sandbox escape -- gh auth status`.
+Every operation that needs the host — git, and all of `gh` — goes through one helper: `.sandbox/host-commands/run <command> [args]`, and `run --help` lists the commands. It is the only thing [`.sandbox/config.toml`](.sandbox/config.toml) allows on the host, so `sandbox escape -- <anything else>` is refused.
+
+```sh
+.sandbox/host-commands/run push <branch>...
+.sandbox/host-commands/run fetch
+.sandbox/host-commands/run gh pr view 7
+```
+
+Unsafe arguments are refused, and each refusal says what to do instead. See [.sandbox/host-commands/README.md](.sandbox/host-commands/README.md); after editing a script there, run `npm run sandbox:hash`.

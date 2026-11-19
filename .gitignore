@@ -41,3 +41,10 @@ stryker.log
 
 # Emails written locally instead of sent
 .outbox/
+
+# The remote's branches as a bundle, written on the host by
+# .sandbox/host-commands/sandbox-git-fetch.sh and read inside the container.
+# Local to one machine. The second line covers the temporary file it is
+# renamed from.
+/.git-mirror.bundle
+/.git-mirror.bundle.*

@@ -28,7 +28,8 @@
     "format": "biome format --write . && prettier --write \"**/*.md\"",
     "format:check": "biome format . && prettier --check \"**/*.md\"",
     "check": "npm run format:check && npm run lint:oxlint && npm run typecheck && npm run lint:boundaries && npm run test",
-    "prepare": "husky"
+    "prepare": "husky",
+    "sandbox:hash": "tsx scripts/sandbox-host-command-hashes.ts"
   },
   "dependencies": {
     "@hello-pangea/dnd": "^18.0.1",
