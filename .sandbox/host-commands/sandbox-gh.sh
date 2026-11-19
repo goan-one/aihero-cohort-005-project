@@ -2,7 +2,7 @@
 # sandbox-gh.sh — the only way `gh` runs on the host.
 #
 # WHAT
-#   sandbox-gh.sh <pr|issue> <subcommand> [argument]...
+#   sandbox-gh.sh <pr|issue|run|workflow> <subcommand> [argument]...
 #   sandbox-gh.sh api <endpoint> [--jq <program>] [--paginate]
 #   sandbox-gh.sh api --method POST <endpoint> -F <field>=<number>
 #   sandbox-gh.sh auth status
@@ -45,6 +45,20 @@
 #   `auth status` is allowed because it reports which account the host is
 #   logged in as and touches no repository; it takes no arguments, because
 #   `--show-token` would print the token into the container.
+#   `run` and `workflow` are read-only, for debugging a workflow: `run list`,
+#   `run view` (including `--log` and `--log-failed`), `workflow list` and
+#   `workflow view`. Refused on purpose:
+#     run rerun, workflow run    -> starts a job that holds the repository's
+#                                   secrets; that stays a human decision.
+#     run cancel, run delete,
+#     workflow enable/disable    -> changes state a human owns.
+#     run download               -> writes artifacts to a host directory the
+#                                   caller would choose (-D).
+#     run watch                  -> blocks until the run ends; not needed to
+#                                   read a result, so not added.
+#   A run id is digits only. A log can hold whatever a step printed; GitHub
+#   masks registered secrets before the log is stored, and that masking is
+#   what this script relies on.
 #   This list is a starting point, not a verified set: see
 #   docs/sandbox-host-access/scripts.md and widen it deliberately.
 #
@@ -68,6 +82,11 @@
 #   The single exception is `--body-file -`, which reads standard input — that
 #   comes from the container through the bridge, not from the host filesystem,
 #   and it is the only sane way to pass a long pull-request body.
+#   Each topic has its own list, because gh reuses short flags with different
+#   meanings: `-w` is --web on `pr` but --workflow on `run list`, and `-b` is
+#   --body on `pr` but --branch on `run list`. One shared list would let a flag
+#   meant for one topic through on another. Where a short flag is refused
+#   everywhere (`-w`, `-e`), `run` takes the long spelling.
 #
 # WHY THE ENVIRONMENT IS REPLACED
 #   A host command inherits the environment of the `sandbox` process, and a
@@ -99,8 +118,10 @@ REPO=goan-one/aihero-cohort-005-project
 
 ALLOWED_PR_SUBCOMMANDS="create view list diff comment edit ready"
 ALLOWED_ISSUE_SUBCOMMANDS="create view list comment edit"
+ALLOWED_RUN_SUBCOMMANDS="list view"
+ALLOWED_WORKFLOW_SUBCOMMANDS="list view"
 
-ALLOWED_FLAGS="--help -h
+ALLOWED_PR_ISSUE_FLAGS="--help -h
 --json --jq -q
 --comments -c
 --limit -L
@@ -118,13 +139,36 @@ ALLOWED_FLAGS="--help -h
 --draft -d
 --name-only --patch"
 
+ALLOWED_RUN_FLAGS="--help -h
+--json --jq -q
+--limit -L
+--workflow
+--branch -b
+--event
+--status -s
+--commit -c
+--user -u
+--created
+--job -j
+--attempt -a
+--verbose -v
+--exit-status
+--log --log-failed"
+
+ALLOWED_WORKFLOW_FLAGS="--help -h
+--json --jq -q
+--limit -L
+--all -a
+--yaml -y
+--ref -r"
+
 PROJECT_DIR=
 GH=
 ENV_TOOL=
 
 usage() {
   cat <<'EOF'
-Usage: sandbox-gh.sh <pr|issue> <subcommand> [argument]...
+Usage: sandbox-gh.sh <pr|issue|run|workflow> <subcommand> [argument]...
        sandbox-gh.sh api <endpoint> [--jq <program>] [--paginate]
        sandbox-gh.sh api --method POST <endpoint> -F <field>=<number>
        sandbox-gh.sh auth status
@@ -134,8 +178,11 @@ EOF
   # this script enforces.
   printf 'Allowed: gh pr    %s\n' "$ALLOWED_PR_SUBCOMMANDS"
   printf '         gh issue %s\n' "$ALLOWED_ISSUE_SUBCOMMANDS"
-  printf 'The repository is always %s: --repo is added for you on pr and\n' "$REPO"
-  echo "issue, built into the path on api, and refused if you pass it."
+  printf '         gh run   %s   (read-only)\n' "$ALLOWED_RUN_SUBCOMMANDS"
+  printf '         gh workflow %s (read-only)\n' "$ALLOWED_WORKFLOW_SUBCOMMANDS"
+  printf 'The repository is always %s: --repo is added for you on pr,\n' "$REPO"
+  echo "issue, run and workflow, built into the path on api, and refused if"
+  echo "you pass it."
   cat <<'EOF'
 
   sandbox-gh.sh issue view 7 --comments
@@ -143,6 +190,14 @@ EOF
   sandbox-gh.sh pr create --base main --head fix/foo --title "..." --body "..."
   sandbox-gh.sh pr create --base main --head fix/foo --title "..." --body-file -
   sandbox-gh.sh auth status
+
+  sandbox-gh.sh run list --workflow agent-implement.yml --limit 5
+  sandbox-gh.sh run view 12345 --log-failed
+  sandbox-gh.sh run view 12345 --json jobs --jq '.jobs[].steps[] | [.name, .conclusion]'
+  sandbox-gh.sh workflow view agent-implement.yml --yaml
+
+`run` takes --workflow and --event in their long form only: -w and -e are
+refused on every topic (--web, --editor). A run id is digits only.
 
 `gh` runs with no local repository, so `pr create` needs --head (and --base);
 --fill and friends are refused because they would read a local checkout.
@@ -214,6 +269,8 @@ check_subcommand() {
   case $topic in
   pr) allowed=$ALLOWED_PR_SUBCOMMANDS ;;
   issue) allowed=$ALLOWED_ISSUE_SUBCOMMANDS ;;
+  run) allowed=$ALLOWED_RUN_SUBCOMMANDS ;;
+  workflow) allowed=$ALLOWED_WORKFLOW_SUBCOMMANDS ;;
   *) refuse "no subcommands are defined for \`$topic\`" ;;
   esac
   for candidate in $allowed; do
@@ -227,19 +284,40 @@ check_subcommand() {
     refuse "\`gh $topic $subcommand\` works on a local checkout, which this helper never touches. Use ordinary git inside the sandbox."
     ;;
   close | reopen | delete | transfer | lock | unlock | pin | unpin)
+    [ "$topic" != run ] ||
+      refuse "\`gh run $subcommand\` changes the state of a workflow run; that stays with a human. Say what you would change, and why."
     refuse "\`gh $topic $subcommand\` changes the state of a ticket; that stays with a human. Say what you would close, and why."
     ;;
   review)
     refuse "an agent does not review or approve a pull request. Use \`$topic comment\` to say what you found."
+    ;;
+  rerun | run)
+    refuse "\`gh $topic $subcommand\` starts a job that holds the repository's secrets; that stays with a human. Say which run to start, and why."
+    ;;
+  cancel | enable | disable)
+    refuse "\`gh $topic $subcommand\` changes the state of a workflow; that stays with a human. Say what you would change, and why."
+    ;;
+  download)
+    refuse "\`gh $topic download\` writes files to a host directory. Read the log with \`run view <id> --log-failed\` instead."
+    ;;
+  watch)
+    refuse "\`gh run watch\` blocks until the run ends. Use \`run view <id> --exit-status\` to read its state."
     ;;
   esac
   refuse "\`gh $topic $subcommand\` is not on the allow-list in .sandbox/host-commands/sandbox-gh.sh (allowed: $allowed)"
 }
 
 is_allowed_flag() {
-  local candidate flag
-  candidate=$1
-  for flag in $ALLOWED_FLAGS; do
+  local topic candidate allowed flag
+  topic=$1
+  candidate=$2
+  case $topic in
+  pr | issue) allowed=$ALLOWED_PR_ISSUE_FLAGS ;;
+  run) allowed=$ALLOWED_RUN_FLAGS ;;
+  workflow) allowed=$ALLOWED_WORKFLOW_FLAGS ;;
+  *) return 1 ;;
+  esac
+  for flag in $allowed; do
     [ "$candidate" != "$flag" ] || return 0
   done
   return 1
@@ -248,7 +326,9 @@ is_allowed_flag() {
 # Scans every argument, because a flag that reads a host file must not get
 # through in any position or spelling (--flag value, --flag=value, -Fvalue).
 check_arguments() {
-  local argument expect_stdin
+  local topic argument expect_stdin
+  topic=$1
+  shift
   expect_stdin=no
   for argument in "$@"; do
     if [ "$expect_stdin" = yes ]; then
@@ -266,7 +346,12 @@ check_arguments() {
     --body-file=* | -F | -F=* | -f | -f=* | --field | --field=* | --raw-field | --raw-field=* | --template | --template=* | --input | --input=*)
       refuse "$argument reads a host file. Use --body, or \`--body-file -\` and pipe the text in."
       ;;
-    --web | -w)
+    -w | -e)
+      [ "$topic" != run ] ||
+        refuse "$argument is refused on every topic (it is --web or --editor elsewhere). Use the long form: --workflow or --event."
+      refuse "$argument opens a browser or an editor on the host. Read the result here instead (--json, --comments)."
+      ;;
+    --web)
       refuse "$argument opens a browser on the host. Read the result here instead (--json, --comments)."
       ;;
     --repo | --repo=* | -R | -R=*)
@@ -275,14 +360,14 @@ check_arguments() {
     --hostname | --hostname=*)
       refuse "$argument would point gh at another GitHub host"
       ;;
-    --fill | --fill-first | --fill-verbose | --editor | -e | --recover | --recover=*)
+    --fill | --fill-first | --fill-verbose | --editor | --recover | --recover=*)
       refuse "$argument reads a local checkout or opens an editor on the host. Pass --title and --body explicitly."
       ;;
     -*)
       # Also catches every short flag with its value attached (-Fx), and every
       # cluster of short flags (-cF), because neither is on the list.
-      is_allowed_flag "${argument%%=*}" ||
-        refuse "$argument is not on the flag allow-list in .sandbox/host-commands/sandbox-gh.sh"
+      is_allowed_flag "$topic" "${argument%%=*}" ||
+        refuse "$argument is not on the \`$topic\` flag allow-list in .sandbox/host-commands/sandbox-gh.sh"
       ;;
     *) ;;
     esac
@@ -427,8 +512,21 @@ run_topic_issue_or_pr() {
   subcommand=$1
   shift
   check_subcommand "$topic" "$subcommand"
-  check_arguments "$@"
+  check_arguments "$topic" "$@"
+  check_run_id "$topic" "$subcommand" "$@"
   run_gh "$topic" "$subcommand" --repo "$REPO" "$@"
+}
+
+# `run view <id>`: the id is the first argument when it is not a flag, and it
+# must be digits only. `run view --job <id>` without a run id is gh's own form.
+check_run_id() {
+  [ "$1" = run ] && [ "$2" = view ] || return 0
+  shift 2
+  case ${1:-} in
+  "" | -*) return 0 ;;
+  esac
+  is_digits "$1" ||
+    refuse "a run id must be digits only, not \`$1\`. Find it with \`run list\`."
 }
 
 # A short, fixed environment instead of the host's whole one — see WHY THE
@@ -476,11 +574,11 @@ main() {
   topic=$1
   shift
   case $topic in
-  pr | issue) run_topic_issue_or_pr "$topic" "$@" ;;
+  pr | issue | run | workflow) run_topic_issue_or_pr "$topic" "$@" ;;
   api) run_topic_api "$@" ;;
   auth) run_topic_auth "$@" ;;
   *)
-    refuse "only \`pr\`, \`issue\`, \`api\` and \`auth status\` are available here, not \`$topic\`"
+    refuse "only \`pr\`, \`issue\`, \`run\`, \`workflow\`, \`api\` and \`auth status\` are available here, not \`$topic\`"
     ;;
   esac
 }

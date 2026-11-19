@@ -17,7 +17,9 @@ Three scripts behind the loader:
   directory, then writes the remote's branches into the project as a single
   bundle file for the container to fetch from. See "Why the mirror left the
   project" below.
-- `sandbox-gh.sh` — replaces every rule that named `gh`. See below.
+- `sandbox-gh.sh` — replaces every rule that named `gh`: issues and pull
+  requests, read-only access to workflow runs and their logs, the Wayfinder
+  `api` endpoints and `auth status`. See below.
 
 ### Why the mirror left the project
 
@@ -84,7 +86,7 @@ before the numbers say so.
 
 ### Why `gh` moved behind the loader too
 
-The existing rule `pattern = ["gh", ["issue", "pr"], "*"]` has three problems:
+The existing rule `pattern = ["gh", ["issue", "pr"], "*"]` has four problems:
 
 1. `gh` is a **bare name**, resolved through the host's `PATH` from the
    agent-controlled working directory. On macOS and Linux this is only
@@ -95,7 +97,6 @@ The existing rule `pattern = ["gh", ["issue", "pr"], "*"]` has three problems:
 3. `*` allows any argument, including `--body-file <path>`, which reads an
    arbitrary host file and publishes its contents; and subcommands such as
    `merge`.
-
 4. Everything the host exports is in `gh`'s environment (the broker passes the
    `sandbox` process's own `process.env`), and `--jq` is a jq program, so
    `--jq env` prints it into the container. On a host that authenticates with
@@ -119,14 +120,78 @@ topics of `sandbox-gh.sh`:
   `GET issues/<n>`, `.../sub_issues`, `.../dependencies/blocked_by`, with
   optional `--jq`/`--paginate`; `POST` to the last two with exactly one
   `-F sub_issue_id=<digits>` or `-F issue_id=<digits>`. The endpoint is
-  relative to the repository, which the script prefixes, so `repos/<someone
-else>/...` cannot be expressed; every id is checked digit by digit, which is
-  also what refuses `-F x=@/etc/passwd`, a `..` segment and a query string.
+  relative to the repository, which the script prefixes, so
+  `repos/<someone-else>/...` cannot be expressed; every id is checked digit by
+  digit, which is also what refuses `-F x=@/etc/passwd`, a `..` segment and a
+  query string.
 
 `--jq` is still allowed. The leak was the environment, and `--jq env` now
 prints the short fixed list: `HOME`, `PATH` and a handful of deliberately empty
 placeholders. gh's jq cannot read files, so with the environment replaced the
 flag is contained.
+
+### Why `run` and `workflow` are there, and why read-only
+
+An agent debugging a failed factory run (`agent-implement.yml` and the others)
+needs to see which step failed and what it printed. Without it, the run page
+says "Sign in to view logs", and the agent has to ask a human to paste them.
+So `run` and `workflow` became two more `gh` topics, under the same rules as
+`pr` and `issue` — `--repo` pinned, flags allow-listed, environment replaced —
+and limited to reading:
+
+- `run list`, filtered with `--workflow`, `--branch`, `--event`, `--status`,
+  `--commit`, `--user`, `--created` and `--limit` — finding the run;
+- `run view <id>`, with `--job`, `--attempt`, `--verbose`, `--exit-status` and
+  `--json`/`--jq` — its jobs, steps and conclusions;
+- `run view <id> --log-failed`, or `--log` — what the failed step, or every
+  step, printed;
+- `workflow list` (`--all`) and `workflow view <name>` (`--yaml`, `--ref`) —
+  the workflows, and their YAML as it is on the remote.
+
+A run id is digits only. `run view --job <id>` without a run id is gh's own
+form and is let through.
+
+Refused, with the reason in each refusal:
+
+- `run rerun`, `workflow run` — they start a job that holds the repository's
+  secrets (`FACTORY_PAT`, the Claude token). Starting one stays a human
+  decision, as adding the `agent:implement` label is.
+- `run cancel`, `run delete`, `workflow enable`, `workflow disable` — they
+  change state a human owns.
+- `run download` — it writes artifacts into a host directory the caller names
+  with `-D`.
+- `run watch` — it blocks until the run ends, which a host command over the
+  bridge is not meant to do; `run view <id> --exit-status` reads the same
+  answer once.
+- `cache`, `secret`, `variable` — not needed to debug a run, and
+  `variable list` prints values.
+
+No `api` endpoint was added for this: `run view --json` already covers
+`actions/runs/<id>/jobs`, and `--log` covers `actions/jobs/<id>/logs`, so the
+`api` allow-list stays at the Wayfinder shapes.
+
+**The flag lists are per topic.** Until `run` arrived, one list served `pr` and
+`issue`. gh reuses short flags with different meanings across topics: `-b` is
+`--body` on `pr` and `--branch` on `run list`, `-a` is `--assignee` on `issue`
+and `--attempt` on `run view`, `-w` is `--web` on `pr` and `--workflow` on
+`run list`. A shared list would let a flag meant for one topic through on
+another — `--log` on `pr`, `--body` on `run`. So each topic checks against its
+own list. `-w` and `-e` stay refused on every topic, because on `pr`, `issue`
+and `workflow view` they open a browser or an editor on the host; `run` takes
+`--workflow` and `--event` in full instead.
+
+**What a log can contain.** A log is whatever a step printed. The runner masks
+every secret it knows of before the log leaves the job, so a registered secret
+appears as `***` on every reader — the web page and `run view --log` alike.
+It cannot mask a value it was never told about, such as a token an agent step
+printed base64-encoded. That is not a leak this topic opens: the same log is
+on the run page for anyone allowed to read it. It is why the topic stops at
+reading, and why the workflows' own defences — who can reach the agent at
+all — matter more than anything here.
+
+**Unverified against the real `gh`.** Like `api` and `auth status`, `run` and
+`workflow` were tested with a fake `gh` that prints its argv; nobody has yet
+run them against GitHub.
 
 `.sandbox/config.toml` therefore holds exactly one rule. The general form of
 the lesson, written where the rules used to be: if a command takes an argument

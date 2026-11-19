@@ -3,15 +3,15 @@
 The container has no credentials and cannot reach the git remote. These four
 files give an agent inside [Sandbox](https://github.com/MaibornWolff/sandbox)
 exactly three operations on the host: push a work branch, fetch the remote, and
-a narrow `gh` for issues and pull requests. They are the _only_ host commands:
+a narrow `gh` for issues, pull requests and reading workflow runs. They are the _only_ host commands:
 `.sandbox/config.toml` holds one rule, and it runs the loader.
 
-| File                   | Runs on       | Does                                                      |
-| ---------------------- | ------------- | --------------------------------------------------------- |
-| `run`                  | the container | builds the `sandbox escape` invocation for the others     |
-| `sandbox-git-push.sh`  | the host      | publishes work branches to the remote                     |
-| `sandbox-git-fetch.sh` | the host      | updates the host-only mirror, writes `.git-mirror.bundle` |
-| `sandbox-gh.sh`        | the host      | `gh pr`, `gh issue`, `gh api`, `gh auth status`           |
+| File                   | Runs on       | Does                                                                     |
+| ---------------------- | ------------- | ------------------------------------------------------------------------ |
+| `run`                  | the container | builds the `sandbox escape` invocation for the others                    |
+| `sandbox-git-push.sh`  | the host      | publishes work branches to the remote                                    |
+| `sandbox-git-fetch.sh` | the host      | updates the host-only mirror, writes `.git-mirror.bundle`                |
+| `sandbox-gh.sh`        | the host      | `gh pr`, `gh issue`, `gh run`, `gh workflow`, `gh api`, `gh auth status` |
 
 Why it is built this way — the threat model, what was rejected and why — is in
 [docs/sandbox-host-access/design-decisions.md](../../docs/sandbox-host-access/design-decisions.md),
@@ -39,6 +39,9 @@ Read the loader in `.sandbox/config.toml` as what it is: a short shell program.
 .sandbox/host-commands/run gh pr create --base main --head fix/foo \
   --title "..." --body "..."
 .sandbox/host-commands/run gh api issues/7 --jq .id
+.sandbox/host-commands/run gh run list --workflow agent-implement.yml --limit 5
+.sandbox/host-commands/run gh run view 12345 --log-failed
+.sandbox/host-commands/run gh workflow view agent-implement.yml --yaml
 .sandbox/host-commands/run gh auth status
 ```
 
@@ -66,6 +69,11 @@ What is refused, and what to do instead:
   closes and approves. Say what you would do, and why.
 - **Anything that reads a host file** (`--body-file <path>`, `-F`, `--template`).
   Use `--body`, or `--body-file -` and pipe the text in.
+- **Anything that starts, stops or changes a workflow run** (`gh run rerun`,
+  `cancel`, `delete`, `gh workflow run`, `enable`, `disable`), and
+  `gh run download`, which writes to a host directory. `run` and `workflow` are
+  read-only: `list` and `view`, with `--log` / `--log-failed` for the logs. Use
+  `--workflow` and `--event` in full; `-w` and `-e` are refused everywhere.
 - **`gh pr checkout` / `gh issue develop`.** They work on a local checkout; use
   ordinary git inside the container.
 - **Any `gh api` endpoint other than the Wayfinder ones.** `run gh api` allows
@@ -73,6 +81,10 @@ What is refused, and what to do instead:
   `issues/<n>/dependencies/blocked_by` — a GET of each, and a POST to the last
   two with one `-F sub_issue_id=<number>` or `-F issue_id=<number>`. The
   repository is built into the path by the script, and every id is digits only.
+
+Each topic has its own flag allow-list, because gh reuses short flags with
+different meanings across topics (`-b` is `--body` on `pr`, `--branch` on
+`run list`).
 
 `gh` runs with no local repository and `--repo` pinned, so `pr create` needs
 `--head` (and usually `--base`); `--fill` is refused for the same reason.
@@ -143,7 +155,7 @@ Porting to another remote is one line per script (`REMOTE_URL`, `REPO`).
   replaces it, and the git scripts unset the `GIT_*` variables that would
   redirect git, but a host command is still started with the environment of the
   `sandbox` process. Do not keep secrets in the shell you start `sandbox` from.
-- **`--body-file -`, `gh api` and `gh auth status` are unverified against the
+- **`--body-file -`, `gh api`, `gh auth status`, `gh run` and `gh workflow` are unverified against the
   real `gh`.** The argv and the environment they produce are tested with a fake
   `gh`; nobody has run them against GitHub yet. Standard input is forwarded
   over the bridge, so `--body-file -` should work.

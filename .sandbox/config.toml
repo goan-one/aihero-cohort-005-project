@@ -231,7 +231,7 @@ SANDBOX_PROJECT_DIR=$root /bin/sh "$copy" "$@"
   { regex = '/([^/]+/)*\.sandbox/host-commands/sandbox-(gh|git-fetch|git-push)\.sh' },
   # BEGIN sandbox:hash — written by `npm run sandbox:hash`, do not edit by hand
   [
-    "d894ea712c71a5b8d353eb6705dbebf2a8aa887e892c2350d4ea2a483716601e", # sandbox-gh.sh
+    "6dbb3e2da13f577d0e52670d032dac24ea40d0c3af753acc1013081faea2a965", # sandbox-gh.sh
     "dd682048d7eea5114778451c8c2ed5764664ebfe6bb7f689c59b470510241bdb", # sandbox-git-fetch.sh
     "a34de436701e62c1bca498ef304eebecef80e17e175180de65e3922e23e62e71", # sandbox-git-push.sh
   ],
